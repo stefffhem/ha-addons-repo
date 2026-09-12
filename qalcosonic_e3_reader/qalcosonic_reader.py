@@ -157,35 +157,49 @@ def _read_meter_once(port: str, timeout: float) -> dict:
         ser.write(frame)
         ser.flush()
 
-        try:
-            raw = meterbus.recv_frame(ser)
-        except serial.SerialException as exc:
-            raise serial.SerialException(f"Fehler beim Lesen der Antwort: {exc}") from exc
-        except Exception as exc:
-            raise MeterReadError(f"Keine gültige M-Bus-Antwort erhalten: {exc}") from exc
+        # Viele einfache IR-Leseköpfe spiegeln die eigene Sendung hardwareseitig
+        # auf die Empfangsleitung zurück (TX->RX-Kopplung zur Baudraten-
+        # erkennung). Die echte Zähler-Antwort folgt dann als zusätzlicher,
+        # separater Frame direkt danach. Deshalb wird nach einem erkannten
+        # Echo einfach weitergelesen, statt sofort aufzugeben.
+        raw_bytes = None
+        for read_attempt in range(1, 4):
+            try:
+                candidate = meterbus.recv_frame(ser)
+            except serial.SerialException as exc:
+                raise serial.SerialException(f"Fehler beim Lesen der Antwort: {exc}") from exc
+            except Exception as exc:
+                if read_attempt == 1:
+                    raise MeterReadError(f"Keine gültige M-Bus-Antwort erhalten: {exc}") from exc
+                break
 
-        if not raw:
-            raise MeterReadError(
-                "Zähler hat auf die M-Bus-Anfrage nicht geantwortet (leere Antwort). "
-                "Ist der Lesekopf richtig auf dem optischen Sensor des Zählers platziert? "
-                "Manche Zähler müssen zusätzlich per Tastendruck aktiviert werden, oder "
-                "brauchen mehr Wakeup-Nullbytes (Option mbus_wakeup_zeros erhöhen)."
+            if not candidate:
+                break
+
+            candidate_bytes = candidate if isinstance(candidate, (bytes, bytearray)) else bytes(candidate)
+            log.info(
+                "Empfangener Frame (Versuch %d, %d Bytes): %s",
+                read_attempt, len(candidate_bytes), candidate_bytes.hex(),
             )
 
-        raw_bytes = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
-        log.info("Rohantwort (%d Bytes): %s", len(raw_bytes), raw_bytes.hex())
+            if candidate_bytes == frame:
+                log.debug("Frame %d ist ein Echo der eigenen Anfrage, lese weiter", read_attempt)
+                continue
 
-        if raw_bytes == frame:
+            raw_bytes = candidate_bytes
+            break
+
+        if not raw_bytes:
             raise MeterReadError(
-                "Der Zähler hat nur die eigene Anfrage zurückgespiegelt (Echo), "
-                "keine echte Antwort gesendet. Das deutet auf ein Ausrichtungs-/"
-                "Kontaktproblem zwischen Lesekopf und optischem Fenster des Zählers hin, "
-                "oder darauf, dass die optische Schnittstelle des Zählers gerade nicht "
-                "aktiv ist (z.B. Tastendruck am Zähler nötig)."
+                "Zähler hat auf die M-Bus-Anfrage nicht mit echten Daten geantwortet "
+                "(nur Echo der eigenen Anfrage oder keine Antwort). Ist der Lesekopf "
+                "richtig auf dem optischen Sensor des Zählers platziert? Manche Zähler "
+                "müssen zusätzlich per Tastendruck aktiviert werden, oder brauchen mehr "
+                "Wakeup-Nullbytes (Option mbus_wakeup_zeros erhöhen)."
             )
 
         try:
-            telegram = meterbus.load(raw)
+            telegram = meterbus.load(raw_bytes)
         except Exception as exc:
             raise MeterReadError(
                 f"Antwort konnte nicht als M-Bus-Telegramm dekodiert werden: {exc}"
