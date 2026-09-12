@@ -3,22 +3,26 @@
 Qalcosonic E3 -> MQTT Reader für Home Assistant
 
 Liest einen Qalcosonic E3 Wärme-/Kältezähler über einen optischen IR-Lesekopf
-(serielle Schnittstelle) nach dem Protokoll IEC 62056-21 (früher IEC 61107 /
-IEC 1107), Auslesemodus C, aus und veröffentlicht die gefundenen Messwerte
-per MQTT in Home Assistant (inkl. MQTT Discovery, d.h. die Sensoren tauchen
-automatisch in Home Assistant auf, ohne dass man sie manuell anlegen muss).
+per M-Bus-Protokoll (EN 13757-2/-3) aus und veröffentlicht die gefundenen
+Messwerte per MQTT in Home Assistant (inkl. MQTT Discovery).
 
-Das Protokoll ist herstellerunabhängig: Der Zähler antwortet auf eine
-Weckanfrage mit einem Kennungstelegramm und schickt danach einen Datenblock
-aus Zeilen der Form:
+Viele optische Wärmezähler-Schnittstellen (u.a. bei Geräten auf Basis des
+Landis+Gyr T230/T330-Moduls, zu denen auch etliche Axioma/Qalcosonic-Modelle
+gehören) sprechen über den IR-Kopf kein IEC-62056-21-Klartextprotokoll,
+sondern binäres M-Bus. Vor der eigentlichen Anfrage muss die optische
+Schnittstelle zusätzlich mit einer Folge von Nullbytes "geweckt" werden.
 
-    CODE(WERT*EINHEIT)
-
-z.B. "6.8(00123.45*MWh)" oder "9.4(032.5*C)". Da der genaue Zeichensatz an
-Codes je nach Zählertyp/Firmware leicht variieren kann, wertet dieses Skript
-JEDE Zeile generisch aus: Der Code wird zum Sensor-Namen, die Einheit
-bestimmt automatisch die passende Home-Assistant-Geräteklasse (Energie,
-Volumen, Temperatur, Leistung, Betriebsstunden, ...).
+Ablauf:
+  1. Serielle Verbindung bei 2400 Baud, 8 Datenbits, gerade Parität, 1 Stopbit
+     öffnen (Standard-Bitrate für M-Bus).
+  2. Eine konfigurierbare Anzahl Nullbytes senden, um die optische
+     Schnittstelle des Zählers aufzuwecken.
+  3. Eine M-Bus REQ_UD2-Kurzanfrage (Kurzrahmen) an die Zähleradresse senden.
+  4. Die Antwort mit der Bibliothek "pyMeterBus" (Modul `meterbus`) einlesen
+     und dekodieren.
+  5. Jeden gefundenen Datensatz generisch als eigenen Sensor veröffentlichen;
+     die Einheit wird anhand des erkannten Werttyps automatisch geraten und
+     bestimmt die passende Home-Assistant-Geräteklasse.
 """
 
 import json
@@ -27,9 +31,15 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import serial
+
+try:
+    import meterbus
+except ImportError:  # pragma: no cover
+    print("pyMeterBus (Modul 'meterbus') ist nicht installiert", file=sys.stderr)
+    raise
 
 try:
     import paho.mqtt.client as mqtt
@@ -52,6 +62,10 @@ TOPIC_PREFIX = os.environ.get("MQTT_TOPIC_PREFIX", "qalcosonic_e3")
 DEVICE_NAME = os.environ.get("DEVICE_NAME", "Wärmezähler")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
 
+MBUS_ADDRESS = int(os.environ.get("MBUS_ADDRESS", "254"))
+MBUS_WAKEUP_ZEROS = int(os.environ.get("MBUS_WAKEUP_ZEROS", "300"))
+MBUS_BAUDRATE = int(os.environ.get("MBUS_BAUDRATE", "2400"))
+
 DEVICE_SLUG = re.sub(r"[^a-z0-9_]+", "_", DEVICE_NAME.lower()).strip("_") or "qalcosonic_e3"
 
 logging.basicConfig(
@@ -62,64 +76,23 @@ log = logging.getLogger("qalcosonic")
 
 
 # ---------------------------------------------------------------------------
-# IEC 62056-21 Auslesung (Modus C) über den IR-Lesekopf
+# M-Bus Auslesung über den IR-Lesekopf
 # ---------------------------------------------------------------------------
-
-# Baudraten-Kennziffer laut Norm -> tatsächliche Baudrate
-BAUD_ID_MAP = {
-    "0": 300,
-    "1": 600,
-    "2": 1200,
-    "3": 2400,
-    "4": 4800,
-    "5": 9600,
-    "6": 19200,
-}
-
-# Erkennt Datenzeilen wie "6.8(00123.45*MWh)" oder "9.21(12345678)"
-LINE_RE = re.compile(r"^([0-9A-Za-z.\-:*]+)\(([^)]*)\)")
-# Erkennt "WERT*EINHEIT" innerhalb der Klammer, mehrere per '&' getrennt möglich
-VALUE_RE = re.compile(r"^([+-]?[0-9]+(?:\.[0-9]+)?)(?:\*(.+))?$")
-
 
 class MeterReadError(Exception):
     pass
 
 
-def read_meter(port: str, timeout: float = 8.0, retries: int = 2) -> dict:
-    """Führt eine vollständige IEC 62056-21 Auslesung durch und gibt ein
-    Dict {code: (value, unit)} mit allen gefundenen Messwerten zurück.
-
-    Bei manchen USB-Seriell-Chips im IR-Lesekopf führt ein Umschalten der
-    Baudrate auf einer bereits geöffneten Verbindung zu einem kurzen
-    Aussetzer, den der Treiber als Verbindungsabbruch meldet. Deshalb wird
-    die Verbindung nach dem ACK geschlossen und mit der neuen Baudrate neu
-    geöffnet, statt die Baudrate live umzuschalten. Schlägt ein Versuch
-    dennoch fehl, wird automatisch bis zu `retries`-mal neu versucht.
-    """
-
-    last_error = None
-    for attempt in range(1, retries + 2):
-        try:
-            return _read_meter_once(port, timeout)
-        except (serial.SerialException, MeterReadError) as exc:
-            last_error = exc
-            log.warning("Ausleseversuch %d fehlgeschlagen: %s", attempt, exc)
-            time.sleep(1.0)
-    raise last_error
-
-
-def _open_serial(port: str, baudrate: int, timeout: float) -> serial.Serial:
+def _open_serial(port: str, baudrate: int, timeout: float, bytesize=serial.EIGHTBITS) -> serial.Serial:
     """Öffnet die serielle Verbindung mit exklusivem Zugriff (verhindert
-    Konflikte mit anderen Prozessen, die denselben Port anfassen, z.B. die
-    automatische USB-Geräteerkennung von Home Assistant) und setzt die
-    DTR-Leitung, da manche IR-Leseköpfe ihre Sendeleistung darüber
+    Konflikte mit anderen Prozessen, die denselben Port anfassen) und setzt
+    die DTR-Leitung, da manche IR-Leseköpfe ihre Sendeleistung darüber
     beziehen."""
 
     ser = serial.Serial(
         port=port,
         baudrate=baudrate,
-        bytesize=serial.SEVENBITS,
+        bytesize=bytesize,
         parity=serial.PARITY_EVEN,
         stopbits=serial.STOPBITS_ONE,
         timeout=timeout,
@@ -133,144 +106,165 @@ def _open_serial(port: str, baudrate: int, timeout: float) -> serial.Serial:
     return ser
 
 
+def _build_req_ud2_frame(address: int) -> bytes:
+    """Baut einen M-Bus-Kurzrahmen für eine REQ_UD2-Datenanfrage (Control=0x7B
+    mit gesetztem FCB, wie in mehreren feldbewährten Implementierungen für
+    optische Wärmezähler-Schnittstellen verwendet)."""
+
+    control = 0x7B
+    checksum = (control + address) % 256
+    return bytes([0x10, control, address, checksum, 0x16])
+
+
+def read_meter(port: str, timeout: float = 8.0, retries: int = 2) -> dict:
+    """Führt eine vollständige M-Bus-Auslesung durch und gibt ein
+    Dict {code: (value, unit)} mit allen gefundenen Messwerten zurück."""
+
+    last_error = None
+    for attempt in range(1, retries + 2):
+        try:
+            return _read_meter_once(port, timeout)
+        except (serial.SerialException, MeterReadError) as exc:
+            last_error = exc
+            log.warning("Ausleseversuch %d fehlgeschlagen: %s", attempt, exc)
+            time.sleep(1.0)
+    raise last_error
+
+
 def _read_meter_once(port: str, timeout: float) -> dict:
-    ser = _open_serial(port, 300, timeout)
+    ser = _open_serial(port, MBUS_BAUDRATE, timeout)
 
     try:
-        # Kurze Settle-Zeit: direkt nach dem Öffnen des Ports können die
-        # ersten gesendeten/empfangenen Bytes bei manchen USB-Seriell-Chips
-        # (u.a. FTDI) noch unzuverlässig sein, bis die Leitung sich stabilisiert.
+        # Kurze Settle-Zeit nach dem Öffnen des Ports (manche USB-Seriell-Chips
+        # verlieren sonst die ersten gesendeten Bytes).
         time.sleep(0.3)
         ser.reset_input_buffer()
         ser.reset_output_buffer()
 
-        # 1. Weckanfrage (Request Message) senden – bis zu 3 Versuche, falls
-        # nur ein Echo der eigenen Sendedaten oder Datenmüll zurückkommt
-        # (z.B. weil der Lesekopf noch nicht sauber auf dem optischen
-        # Fenster des Zählers aufliegt).
-        identification = b""
-        for wake_attempt in range(1, 4):
-            ser.reset_input_buffer()
-            log.debug("Sende Weckanfrage /?! (Versuch %d)", wake_attempt)
-            ser.write(b"/?!\r\n")
-            ser.flush()
+        log.debug(
+            "Sende %d Wakeup-Nullbytes bei %d Baud, um die optische "
+            "Schnittstelle zu wecken",
+            MBUS_WAKEUP_ZEROS,
+            MBUS_BAUDRATE,
+        )
+        ser.write(b"\x00" * MBUS_WAKEUP_ZEROS)
+        ser.flush()
+        time.sleep(0.5)
 
-            try:
-                identification = ser.readline()
-            except serial.SerialException as exc:
-                raise serial.SerialException(f"Fehler beim Lesen der Kennung: {exc}") from exc
-            log.debug("Kennung empfangen (Versuch %d): %r", wake_attempt, identification)
-
-            if identification.startswith(b"/"):
-                break
-            time.sleep(0.5)
-
-        if not identification.startswith(b"/"):
-            raise MeterReadError(
-                f"Keine gültige Antwort vom Zähler erhalten (bekommen: {identification!r}). "
-                "Ist der Lesekopf richtig auf dem optischen Sensor des Zählers platziert? "
-                "Manche Zähler-Displays müssen zusätzlich per Tastendruck aktiviert werden, "
-                "damit die optische Schnittstelle für ein paar Sekunden antwortet."
-            )
-
-        # Baudraten-Kennziffer ist das 5. Zeichen (Index 4), z.B. "/AXM5xxxxxx"
-        baud_id = chr(identification[4]) if len(identification) > 4 else "0"
-        new_baud = BAUD_ID_MAP.get(baud_id, 300)
-        log.debug("Zähler bietet Baudrate-ID '%s' -> %d Baud an", baud_id, new_baud)
-
-        # 3. ACK senden: <ACK>0<Z>0<CR><LF> -> wählt Modus C (Datenübertragung, Standard)
-        ack = bytes([0x06]) + b"0" + baud_id.encode() + b"0\r\n"
-        ser.write(ack)
+        frame = _build_req_ud2_frame(MBUS_ADDRESS)
+        log.debug("Sende REQ_UD2-Anfrage: %s", frame.hex())
+        ser.reset_input_buffer()
+        ser.write(frame)
         ser.flush()
 
-        # Kurze Pause laut Norm (max. 1500ms Umschaltzeit)
-        time.sleep(0.3)
+        try:
+            raw = meterbus.recv_frame(ser)
+        except serial.SerialException as exc:
+            raise serial.SerialException(f"Fehler beim Lesen der Antwort: {exc}") from exc
+        except Exception as exc:
+            raise MeterReadError(f"Keine gültige M-Bus-Antwort erhalten: {exc}") from exc
 
-    finally:
-        ser.close()
-
-    # 3b. Verbindung mit der neuen Baudrate NEU öffnen, statt sie auf der
-    # bestehenden Verbindung live umzuschalten (robuster bei USB-Seriell-Chips)
-    ser = _open_serial(port, new_baud, timeout)
-
-    try:
-        # 4. Datenblock lesen, bis Endezeile "!" kommt oder Timeout erreicht ist
-        raw_lines = []
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                line = ser.readline()
-            except serial.SerialException as exc:
-                raise serial.SerialException(
-                    f"Fehler beim Lesen des Datenblocks (nach {len(raw_lines)} Zeile(n)): {exc}"
-                ) from exc
-            if not line:
-                break
-            raw_lines.append(line)
-            if line.strip() == b"!":
-                break
-
-        if not raw_lines:
-            raise MeterReadError("Zähler hat keine Daten gesendet (Timeout).")
-
-        log.debug("Rohe Telegrammzeilen: %r", raw_lines)
-        parsed = _parse_data_block(raw_lines)
-
-        if not parsed:
-            log.warning(
-                "Datenblock erhalten, aber keine Zeile passte zum erwarteten Muster "
-                "CODE(WERT*EINHEIT). Rohe Zeilen vom Zähler: %s",
-                [line.decode("ascii", errors="replace").strip() for line in raw_lines],
+        if not raw:
+            raise MeterReadError(
+                "Zähler hat auf die M-Bus-Anfrage nicht geantwortet (leere Antwort). "
+                "Ist der Lesekopf richtig auf dem optischen Sensor des Zählers platziert? "
+                "Manche Zähler müssen zusätzlich per Tastendruck aktiviert werden, oder "
+                "brauchen mehr Wakeup-Nullbytes (Option mbus_wakeup_zeros erhöhen)."
             )
 
-        return parsed
+        log.debug("Rohantwort (%d Bytes): %r", len(raw), raw)
+
+        try:
+            telegram = meterbus.load(raw)
+        except Exception as exc:
+            raise MeterReadError(
+                f"Antwort konnte nicht als M-Bus-Telegramm dekodiert werden: {exc}"
+            ) from exc
+
+        try:
+            body_json = telegram.body.to_JSON()
+        except Exception as exc:
+            raise MeterReadError(
+                f"Telegramm enthielt keine auswertbaren Nutzdaten: {exc}"
+            ) from exc
+
+        log.info("Rohes M-Bus-Telegramm (JSON): %s", body_json)
+
+        try:
+            parsed = json.loads(body_json)
+        except (TypeError, ValueError) as exc:
+            raise MeterReadError(f"Antwort war kein gültiges JSON: {exc}") from exc
+
+        return _extract_values(parsed)
 
     finally:
         ser.close()
 
 
-def _parse_data_block(raw_lines) -> dict:
-    """Parst die rohen Telegrammzeilen generisch in {code: (value, unit)}."""
+def _extract_values(parsed: dict) -> dict:
+    """Wandelt die von pyMeterBus gelieferte Datensatzliste generisch in
+    {code: (value, unit)} um."""
 
     results = {}
-    for raw in raw_lines:
-        try:
-            text = raw.decode("ascii", errors="replace").strip()
-        except Exception:
+    records = parsed.get("records", []) if isinstance(parsed, dict) else []
+
+    for idx, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        rtype = str(record.get("type", f"record_{idx}"))
+        value = record.get("value")
+        if value is None:
             continue
 
-        if not text or text in ("!", "\x02", "\x03"):
-            continue
+        base_code = re.sub(r"[^a-z0-9_]+", "_", rtype.lower()).strip("_") or f"record_{idx}"
+        code = base_code
+        suffix = 2
+        while code in results:
+            code = f"{base_code}_{suffix}"
+            suffix += 1
 
-        match = LINE_RE.match(text)
-        if not match:
-            continue
-
-        code, content = match.group(1), match.group(2)
-        if not content:
-            continue
-
-        # Mehrere Werte können innerhalb einer Zeile per '&' getrennt sein,
-        # z.B. Vorlauf- und Rücklauftemperatur in derselben Zeile.
-        parts = content.split("&")
-        for idx, part in enumerate(parts):
-            value_match = VALUE_RE.match(part.strip())
-            key = code if len(parts) == 1 else f"{code}_{idx + 1}"
-            if value_match:
-                value_str, unit = value_match.group(1), value_match.group(2)
-                try:
-                    value = float(value_str)
-                    if value.is_integer():
-                        value = int(value)
-                except ValueError:
-                    value = value_str
-                results[key] = (value, unit or "")
-            else:
-                # Nicht-numerischer Inhalt (z.B. Datum, Seriennummer, Text)
-                results[key] = (part.strip(), "")
+        results[code] = (value, _guess_unit(rtype))
 
     log.info("Zähler ausgelesen: %d Datenpunkte gefunden", len(results))
     return results
+
+
+# Grobe Zuordnung von Schlüsselwörtern im pyMeterBus-Werttyp (z.B.
+# "VIFUnit.ENERGY_WH") zu einer für Home Assistant sinnvollen Einheit.
+# Kann anhand der echten Roh-JSON-Ausgabe (siehe Log) bei Bedarf präzisiert
+# werden.
+_TYPE_TO_UNIT = [
+    ("ENERGY_WH", "Wh"),
+    ("ENERGY_KWH", "kWh"),
+    ("ENERGY_MWH", "MWh"),
+    ("ENERGY_MJ", "MJ"),
+    ("ENERGY_GJ", "GJ"),
+    ("ENERGY_J", "J"),
+    ("ENERGY", "kWh"),
+    ("VOLUME_FLOW", "m³/h"),
+    ("VOLUME", "m³"),
+    ("FLOW_TEMPERATURE", "°C"),
+    ("RETURN_TEMPERATURE", "°C"),
+    ("TEMPERATURE_DIFFERENCE", "K"),
+    ("TEMPERATURE", "°C"),
+    ("POWER_KW", "kW"),
+    ("POWER_W", "W"),
+    ("POWER", "W"),
+    ("ACTUALITY_DURATION", "h"),
+    ("OPERATING_TIME", "h"),
+    ("ON_TIME", "h"),
+    ("DURATION", "h"),
+    ("PRESSURE", "bar"),
+    ("BATTERY", "d"),
+]
+
+
+def _guess_unit(rtype: str) -> str:
+    upper = rtype.upper()
+    for keyword, unit in _TYPE_TO_UNIT:
+        if keyword in upper:
+            return unit
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -288,16 +282,22 @@ UNIT_MAP = {
     "wh": UnitInfo("energy", "total_increasing", "mdi:lightning-bolt"),
     "kwh": UnitInfo("energy", "total_increasing", "mdi:lightning-bolt"),
     "mwh": UnitInfo("energy", "total_increasing", "mdi:lightning-bolt"),
+    "j": UnitInfo("energy", "total_increasing", "mdi:lightning-bolt"),
+    "mj": UnitInfo("energy", "total_increasing", "mdi:lightning-bolt"),
     "gj": UnitInfo("energy", "total_increasing", "mdi:fire"),
     "m3": UnitInfo("water", "total_increasing", "mdi:water"),
+    "m³": UnitInfo("water", "total_increasing", "mdi:water"),
     "l": UnitInfo("water", "total_increasing", "mdi:water"),
     "m3ph": UnitInfo(None, "measurement", "mdi:water-pump"),
     "m3/h": UnitInfo(None, "measurement", "mdi:water-pump"),
+    "m³/h": UnitInfo(None, "measurement", "mdi:water-pump"),
     "c": UnitInfo("temperature", "measurement", "mdi:thermometer"),
     "°c": UnitInfo("temperature", "measurement", "mdi:thermometer"),
+    "k": UnitInfo("temperature", "measurement", "mdi:thermometer"),
     "kw": UnitInfo("power", "measurement", "mdi:flash"),
     "w": UnitInfo("power", "measurement", "mdi:flash"),
     "h": UnitInfo("duration", "total_increasing", "mdi:clock-outline"),
+    "d": UnitInfo(None, "measurement", "mdi:battery-clock"),
     "bar": UnitInfo("pressure", "measurement", "mdi:gauge"),
 }
 
@@ -378,7 +378,6 @@ class MqttPublisher:
         if info.state_class:
             payload["state_class"] = info.state_class
 
-        # None-Werte entfernen (MQTT Discovery mag keine null-Felder für Strings)
         payload = {k: v for k, v in payload.items() if v is not None}
 
         self.client.publish(config_topic, json.dumps(payload), retain=True)
@@ -406,7 +405,11 @@ class MqttPublisher:
 # ---------------------------------------------------------------------------
 
 def main():
-    log.info("Qalcosonic E3 Reader gestartet (Port=%s, Intervall=%ss)", SERIAL_PORT, POLL_INTERVAL)
+    log.info(
+        "Qalcosonic E3 Reader gestartet (Port=%s, Intervall=%ss, M-Bus-Adresse=%s, "
+        "Baudrate=%s, Wakeup-Nullbytes=%s)",
+        SERIAL_PORT, POLL_INTERVAL, MBUS_ADDRESS, MBUS_BAUDRATE, MBUS_WAKEUP_ZEROS,
+    )
 
     publisher = MqttPublisher()
     publisher.connect()
