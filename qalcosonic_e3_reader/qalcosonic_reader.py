@@ -137,24 +137,40 @@ def _read_meter_once(port: str, timeout: float) -> dict:
     ser = _open_serial(port, 300, timeout)
 
     try:
+        # Kurze Settle-Zeit: direkt nach dem Öffnen des Ports können die
+        # ersten gesendeten/empfangenen Bytes bei manchen USB-Seriell-Chips
+        # (u.a. FTDI) noch unzuverlässig sein, bis die Leitung sich stabilisiert.
+        time.sleep(0.3)
         ser.reset_input_buffer()
         ser.reset_output_buffer()
 
-        # 1. Weckanfrage (Request Message) senden
-        log.debug("Sende Weckanfrage /?!")
-        ser.write(b"/?!\r\n")
-        ser.flush()
+        # 1. Weckanfrage (Request Message) senden – bis zu 3 Versuche, falls
+        # nur ein Echo der eigenen Sendedaten oder Datenmüll zurückkommt
+        # (z.B. weil der Lesekopf noch nicht sauber auf dem optischen
+        # Fenster des Zählers aufliegt).
+        identification = b""
+        for wake_attempt in range(1, 4):
+            ser.reset_input_buffer()
+            log.debug("Sende Weckanfrage /?! (Versuch %d)", wake_attempt)
+            ser.write(b"/?!\r\n")
+            ser.flush()
 
-        # 2. Kennungstelegramm empfangen: /XXXZyyyyyyyyyy<CR><LF>
-        try:
-            identification = ser.readline()
-        except serial.SerialException as exc:
-            raise serial.SerialException(f"Fehler beim Lesen der Kennung: {exc}") from exc
-        log.debug("Kennung empfangen: %r", identification)
+            try:
+                identification = ser.readline()
+            except serial.SerialException as exc:
+                raise serial.SerialException(f"Fehler beim Lesen der Kennung: {exc}") from exc
+            log.debug("Kennung empfangen (Versuch %d): %r", wake_attempt, identification)
+
+            if identification.startswith(b"/"):
+                break
+            time.sleep(0.5)
+
         if not identification.startswith(b"/"):
             raise MeterReadError(
                 f"Keine gültige Antwort vom Zähler erhalten (bekommen: {identification!r}). "
-                "Ist der Lesekopf richtig auf dem optischen Sensor des Zählers platziert?"
+                "Ist der Lesekopf richtig auf dem optischen Sensor des Zählers platziert? "
+                "Manche Zähler-Displays müssen zusätzlich per Tastendruck aktiviert werden, "
+                "damit die optische Schnittstelle für ein paar Sekunden antwortet."
             )
 
         # Baudraten-Kennziffer ist das 5. Zeichen (Index 4), z.B. "/AXM5xxxxxx"
