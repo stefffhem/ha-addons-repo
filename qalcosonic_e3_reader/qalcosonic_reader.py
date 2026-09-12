@@ -155,7 +155,7 @@ def _read_meter_once(port: str, timeout: float) -> dict:
         )
         ser.write(b"\x00" * MBUS_WAKEUP_ZEROS)
         ser.flush()
-        time.sleep(0.5)
+        time.sleep(1.0)
 
         frame = _build_req_ud2_frame(MBUS_ADDRESS)
         log.debug("Sende REQ_UD2-Anfrage: %s", frame.hex())
