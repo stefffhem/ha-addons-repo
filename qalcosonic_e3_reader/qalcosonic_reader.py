@@ -109,15 +109,32 @@ def read_meter(port: str, timeout: float = 8.0, retries: int = 2) -> dict:
     raise last_error
 
 
-def _read_meter_once(port: str, timeout: float) -> dict:
+def _open_serial(port: str, baudrate: int, timeout: float) -> serial.Serial:
+    """Öffnet die serielle Verbindung mit exklusivem Zugriff (verhindert
+    Konflikte mit anderen Prozessen, die denselben Port anfassen, z.B. die
+    automatische USB-Geräteerkennung von Home Assistant) und setzt die
+    DTR-Leitung, da manche IR-Leseköpfe ihre Sendeleistung darüber
+    beziehen."""
+
     ser = serial.Serial(
         port=port,
-        baudrate=300,
+        baudrate=baudrate,
         bytesize=serial.SEVENBITS,
         parity=serial.PARITY_EVEN,
         stopbits=serial.STOPBITS_ONE,
         timeout=timeout,
+        exclusive=True,
     )
+    try:
+        ser.dtr = True
+        ser.rts = False
+    except Exception as exc:  # nicht jeder Adapter unterstützt das
+        log.debug("DTR/RTS konnten nicht gesetzt werden: %s", exc)
+    return ser
+
+
+def _read_meter_once(port: str, timeout: float) -> dict:
+    ser = _open_serial(port, 300, timeout)
 
     try:
         ser.reset_input_buffer()
@@ -129,7 +146,10 @@ def _read_meter_once(port: str, timeout: float) -> dict:
         ser.flush()
 
         # 2. Kennungstelegramm empfangen: /XXXZyyyyyyyyyy<CR><LF>
-        identification = ser.readline()
+        try:
+            identification = ser.readline()
+        except serial.SerialException as exc:
+            raise serial.SerialException(f"Fehler beim Lesen der Kennung: {exc}") from exc
         log.debug("Kennung empfangen: %r", identification)
         if not identification.startswith(b"/"):
             raise MeterReadError(
@@ -155,21 +175,19 @@ def _read_meter_once(port: str, timeout: float) -> dict:
 
     # 3b. Verbindung mit der neuen Baudrate NEU öffnen, statt sie auf der
     # bestehenden Verbindung live umzuschalten (robuster bei USB-Seriell-Chips)
-    ser = serial.Serial(
-        port=port,
-        baudrate=new_baud,
-        bytesize=serial.SEVENBITS,
-        parity=serial.PARITY_EVEN,
-        stopbits=serial.STOPBITS_ONE,
-        timeout=timeout,
-    )
+    ser = _open_serial(port, new_baud, timeout)
 
     try:
         # 4. Datenblock lesen, bis Endezeile "!" kommt oder Timeout erreicht ist
         raw_lines = []
         deadline = time.time() + timeout
         while time.time() < deadline:
-            line = ser.readline()
+            try:
+                line = ser.readline()
+            except serial.SerialException as exc:
+                raise serial.SerialException(
+                    f"Fehler beim Lesen des Datenblocks (nach {len(raw_lines)} Zeile(n)): {exc}"
+                ) from exc
             if not line:
                 break
             raw_lines.append(line)
