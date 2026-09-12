@@ -7,7 +7,7 @@ RUN apk add --no-cache \
         py3-pip \
         py3-serial \
     && pip3 install --no-cache-dir --break-system-packages \
-        paho-mqtt>=1.6,<2.0
+        "paho-mqtt>=1.6,<2.0"
 
 COPY run.sh /run.sh
 COPY qalcosonic_reader.py /qalcosonic_reader.py
