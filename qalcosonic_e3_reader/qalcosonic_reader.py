@@ -116,9 +116,15 @@ def _build_req_ud2_frame(address: int) -> bytes:
     return bytes([0x10, control, address, checksum, 0x16])
 
 
-def read_meter(port: str, timeout: float = 8.0, retries: int = 2) -> dict:
+def read_meter(port: str, timeout: float = 8.0, retries: int = 6) -> dict:
     """Führt eine vollständige M-Bus-Auslesung durch und gibt ein
-    Dict {code: (value, unit)} mit allen gefundenen Messwerten zurück."""
+    Dict {code: (value, unit)} mit allen gefundenen Messwerten zurück.
+
+    Da bei manchen Zählern/Leseköpfen guter optischer Kontakt nur kurz
+    ansteht, wird bei einem reinen Echo oder fehlender Antwort mehrfach mit
+    ansteigender Pause neu versucht, statt nach wenigen schnellen Versuchen
+    aufzugeben.
+    """
 
     last_error = None
     for attempt in range(1, retries + 2):
@@ -127,7 +133,7 @@ def read_meter(port: str, timeout: float = 8.0, retries: int = 2) -> dict:
         except (serial.SerialException, MeterReadError) as exc:
             last_error = exc
             log.warning("Ausleseversuch %d fehlgeschlagen: %s", attempt, exc)
-            time.sleep(1.0)
+            time.sleep(min(2.0 * attempt, 10.0))
     raise last_error
 
 
