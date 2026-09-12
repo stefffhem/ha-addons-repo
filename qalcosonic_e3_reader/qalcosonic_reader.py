@@ -172,7 +172,17 @@ def _read_meter_once(port: str, timeout: float) -> dict:
                 "brauchen mehr Wakeup-Nullbytes (Option mbus_wakeup_zeros erhöhen)."
             )
 
-        log.debug("Rohantwort (%d Bytes): %r", len(raw), raw)
+        raw_bytes = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
+        log.info("Rohantwort (%d Bytes): %s", len(raw_bytes), raw_bytes.hex())
+
+        if raw_bytes == frame:
+            raise MeterReadError(
+                "Der Zähler hat nur die eigene Anfrage zurückgespiegelt (Echo), "
+                "keine echte Antwort gesendet. Das deutet auf ein Ausrichtungs-/"
+                "Kontaktproblem zwischen Lesekopf und optischem Fenster des Zählers hin, "
+                "oder darauf, dass die optische Schnittstelle des Zählers gerade nicht "
+                "aktiv ist (z.B. Tastendruck am Zähler nötig)."
+            )
 
         try:
             telegram = meterbus.load(raw)
@@ -185,7 +195,7 @@ def _read_meter_once(port: str, timeout: float) -> dict:
             body_json = telegram.body.to_JSON()
         except Exception as exc:
             raise MeterReadError(
-                f"Telegramm enthielt keine auswertbaren Nutzdaten: {exc}"
+                f"Telegramm enthielt keine auswertbaren Nutzdaten (Typ: {type(telegram).__name__}): {exc}"
             ) from exc
 
         log.info("Rohes M-Bus-Telegramm (JSON): %s", body_json)
