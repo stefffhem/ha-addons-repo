@@ -2,7 +2,6 @@ name: "Qalcosonic E3 Wärmezähler"
 version: "1.0.0"
 slug: "qalcosonic_e3_reader"
 description: "Liest den Zählerstand eines Qalcosonic E3 Wärmezählers über einen IR-Lesekopf aus und veröffentlicht ihn per MQTT in Home Assistant"
-url: ""
 arch:
   - aarch64
   - amd64
