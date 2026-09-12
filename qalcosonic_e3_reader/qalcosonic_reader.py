@@ -86,10 +86,30 @@ class MeterReadError(Exception):
     pass
 
 
-def read_meter(port: str, timeout: float = 8.0) -> dict:
+def read_meter(port: str, timeout: float = 8.0, retries: int = 2) -> dict:
     """Führt eine vollständige IEC 62056-21 Auslesung durch und gibt ein
-    Dict {code: (value, unit)} mit allen gefundenen Messwerten zurück."""
+    Dict {code: (value, unit)} mit allen gefundenen Messwerten zurück.
 
+    Bei manchen USB-Seriell-Chips im IR-Lesekopf führt ein Umschalten der
+    Baudrate auf einer bereits geöffneten Verbindung zu einem kurzen
+    Aussetzer, den der Treiber als Verbindungsabbruch meldet. Deshalb wird
+    die Verbindung nach dem ACK geschlossen und mit der neuen Baudrate neu
+    geöffnet, statt die Baudrate live umzuschalten. Schlägt ein Versuch
+    dennoch fehl, wird automatisch bis zu `retries`-mal neu versucht.
+    """
+
+    last_error = None
+    for attempt in range(1, retries + 2):
+        try:
+            return _read_meter_once(port, timeout)
+        except (serial.SerialException, MeterReadError) as exc:
+            last_error = exc
+            log.warning("Ausleseversuch %d fehlgeschlagen: %s", attempt, exc)
+            time.sleep(1.0)
+    raise last_error
+
+
+def _read_meter_once(port: str, timeout: float) -> dict:
     ser = serial.Serial(
         port=port,
         baudrate=300,
@@ -127,11 +147,24 @@ def read_meter(port: str, timeout: float = 8.0) -> dict:
         ser.write(ack)
         ser.flush()
 
-        # Kurze Pause laut Norm (max. 1500ms Umschaltzeit), dann Baudrate umstellen
+        # Kurze Pause laut Norm (max. 1500ms Umschaltzeit)
         time.sleep(0.3)
-        if new_baud != 300:
-            ser.baudrate = new_baud
 
+    finally:
+        ser.close()
+
+    # 3b. Verbindung mit der neuen Baudrate NEU öffnen, statt sie auf der
+    # bestehenden Verbindung live umzuschalten (robuster bei USB-Seriell-Chips)
+    ser = serial.Serial(
+        port=port,
+        baudrate=new_baud,
+        bytesize=serial.SEVENBITS,
+        parity=serial.PARITY_EVEN,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=timeout,
+    )
+
+    try:
         # 4. Datenblock lesen, bis Endezeile "!" kommt oder Timeout erreicht ist
         raw_lines = []
         deadline = time.time() + timeout
