@@ -213,7 +213,17 @@ def _read_meter_once(port: str, timeout: float) -> dict:
         if not raw_lines:
             raise MeterReadError("Zähler hat keine Daten gesendet (Timeout).")
 
-        return _parse_data_block(raw_lines)
+        log.debug("Rohe Telegrammzeilen: %r", raw_lines)
+        parsed = _parse_data_block(raw_lines)
+
+        if not parsed:
+            log.warning(
+                "Datenblock erhalten, aber keine Zeile passte zum erwarteten Muster "
+                "CODE(WERT*EINHEIT). Rohe Zeilen vom Zähler: %s",
+                [line.decode("ascii", errors="replace").strip() for line in raw_lines],
+            )
+
+        return parsed
 
     finally:
         ser.close()
